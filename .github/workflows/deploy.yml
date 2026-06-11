@@ -1,0 +1,142 @@
+name: Frontend CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: uptimehub-frontend
+  CONTAINER_NAME: uptimehub-frontend
+  DOCKER_NETWORK: infra_booking-network
+
+jobs:
+  validate-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL || '/gateway' }}
+      VITE_KEYCLOAK_URL: ${{ vars.VITE_KEYCLOAK_URL || 'http://84.247.166.242:8080' }}
+      VITE_KEYCLOAK_TOKEN_BASE_URL: ${{ vars.VITE_KEYCLOAK_TOKEN_BASE_URL || '/keycloak' }}
+      VITE_KEYCLOAK_REALM: ${{ vars.VITE_KEYCLOAK_REALM || 'booking-system' }}
+      VITE_KEYCLOAK_CLIENT_ID: ${{ vars.VITE_KEYCLOAK_CLIENT_ID || 'frontend-client' }}
+      VITE_ENABLE_DEV_TOKEN: ${{ vars.VITE_ENABLE_DEV_TOKEN || 'false' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build app
+        run: npm run build
+
+      - name: Build Docker image
+        env:
+          IMAGE_TAG: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg VITE_API_BASE_URL="$VITE_API_BASE_URL" \
+            --build-arg VITE_KEYCLOAK_URL="$VITE_KEYCLOAK_URL" \
+            --build-arg KEYCLOAK_EXCHANGE_BASE_URL="$VITE_KEYCLOAK_TOKEN_BASE_URL" \
+            --build-arg VITE_KEYCLOAK_REALM="$VITE_KEYCLOAK_REALM" \
+            --build-arg VITE_KEYCLOAK_CLIENT_ID="$VITE_KEYCLOAK_CLIENT_ID" \
+            --build-arg ENABLE_DEV_PANEL="$VITE_ENABLE_DEV_TOKEN" \
+            -t "$IMAGE_TAG" .
+          docker save "$IMAGE_TAG" | gzip > frontend-image.tar.gz
+
+      - name: Configure SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_SSH_KEY"
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$DEPLOY_PORT" "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload image to server
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+        run: |
+          set -euo pipefail
+          DEPLOY_USER="${DEPLOY_USER:-root}"
+          scp -i ~/.ssh/deploy_key -P "$DEPLOY_PORT" \
+            frontend-image.tar.gz \
+            "$DEPLOY_USER@$DEPLOY_HOST:/tmp/uptimehub-frontend-${GITHUB_SHA}.tar.gz"
+
+      - name: Deploy container
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+          FRONTEND_PORT: ${{ secrets.FRONTEND_PORT || '80' }}
+          IMAGE_TAG: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          REMOTE_IMAGE_ARCHIVE: /tmp/uptimehub-frontend-${{ github.sha }}.tar.gz
+        run: |
+          set -euo pipefail
+          DEPLOY_USER="${DEPLOY_USER:-root}"
+          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "IMAGE_TAG='$IMAGE_TAG' CONTAINER_NAME='$CONTAINER_NAME' DOCKER_NETWORK='$DOCKER_NETWORK' FRONTEND_PORT='$FRONTEND_PORT' REMOTE_IMAGE_ARCHIVE='$REMOTE_IMAGE_ARCHIVE' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          docker network inspect "$DOCKER_NETWORK" >/dev/null
+          docker load -i "$REMOTE_IMAGE_ARCHIVE"
+
+          docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+          docker run -d \
+            --name "$CONTAINER_NAME" \
+            --restart unless-stopped \
+            --network "$DOCKER_NETWORK" \
+            -p "${FRONTEND_PORT}:80" \
+            "$IMAGE_TAG"
+
+          rm -f "$REMOTE_IMAGE_ARCHIVE"
+
+          for attempt in $(seq 1 20); do
+            if curl -fsS "http://127.0.0.1:${FRONTEND_PORT}/" >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker logs "$CONTAINER_NAME" --tail 100
+          exit 1
+          REMOTE
+
+      - name: Prune old frontend images
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+        run: |
+          set -euo pipefail
+          DEPLOY_USER="${DEPLOY_USER:-root}"
+          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "docker image prune -af --filter label=app=uptimehub-frontend --filter until=168h || true"
